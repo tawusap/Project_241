@@ -1,0 +1,45 @@
+# Airflow
+logs/
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.egg
+.pytest_cache/
+config/
+
+# Python
+venv/
+env/
+.venv
+.venv_wsl/
+.env
+.env.local
+*.pyc
+.Python
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Data
+processed_data/
+archive/
+*.csv.backup
+*.db
+*.sqlite
+
+# Docker
+.docker/
+docker-compose.override.yml
+
+# OS
+Thumbs.db
+.directory
+
+# Claude Code
+.claude/
