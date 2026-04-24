@@ -297,7 +297,11 @@ class TestSaveDataCleanup(unittest.TestCase):
             quar_dir = os.path.join(tmpdir, 'quarantine')
             src_file = os.path.join(tmpdir, 'yellow_tripdata_2019-01.parquet')
 
-            pd.DataFrame({'a': [1, 2]}).to_parquet(src_file, index=False)
+            pd.DataFrame({
+                'source_file':  ['f.csv', 'f.csv'],
+                'error_reason': ['Fare amount <= 0 or NaN', 'Fare amount <= 0 or NaN'],
+                'fare_amount':  [-1.0, -2.0],
+            }).to_parquet(src_file, index=False)
             self.assertTrue(os.path.exists(src_file))
 
             store = {'quarantine_temp_paths': [src_file], 'quarantine_data_rows': 2}
@@ -307,8 +311,9 @@ class TestSaveDataCleanup(unittest.TestCase):
                 save_quarantine_data(**ctx)
 
             self.assertFalse(os.path.exists(src_file), "Temp quarantine file was not removed")
-            quar_files = os.listdir(quar_dir)
-            self.assertEqual(len(quar_files), 1)
+            # Files are now saved inside error-type subfolders
+            saved = [f for _, _, fs in os.walk(quar_dir) for f in fs]
+            self.assertEqual(len(saved), 1)
 
 
 if __name__ == '__main__':

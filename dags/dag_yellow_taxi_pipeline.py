@@ -11,6 +11,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+CHUNK_SIZE = 100_000
 DATA_QUALITY_THRESHOLD = 80
 CLEAN_DATA_PATH = '/opt/airflow/processed_data/silver'
 QUARANTINE_DATA_PATH = '/opt/airflow/processed_data/quarantine'
@@ -38,7 +39,7 @@ def get_csv_files(**context):
     archive_path = '/opt/airflow/archive/test_raw'
 
     if not os.path.exists(archive_path):
-        logger.warning(f"Archive path {archive_path} does not exist. Creating it.")
+        logger.warning(f"Raw path {archive_path} does not exist. Creating it.")
         os.makedirs(archive_path, exist_ok=True)
         csv_files = []
     else:
@@ -78,6 +79,8 @@ def validate_and_split(**context):
         context['task_instance'].xcom_push(key='validation_results', value=empty_results)
         context['task_instance'].xcom_push(key='clean_data_rows', value=0)
         context['task_instance'].xcom_push(key='quarantine_data_rows', value=0)
+        context['task_instance'].xcom_push(key='clean_temp_paths', value=[])
+        context['task_instance'].xcom_push(key='quarantine_temp_paths', value=[])
         return empty_results
 
     validation_results = {
@@ -87,6 +90,9 @@ def validate_and_split(**context):
         'quarantine_records': 0,
         'details': []
     }
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
 
     clean_temp_paths = []
     quarantine_temp_paths = []
@@ -99,13 +105,12 @@ def validate_and_split(**context):
         try:
             logger.info(f"Validating {csv_file}...")
 
-            df = pd.read_csv(csv_path, low_memory=False)
-
             required_columns = [
                 'tpep_pickup_datetime', 'tpep_dropoff_datetime',
                 'fare_amount', 'trip_distance', 'passenger_count'
             ]
-            missing_columns = [col for col in required_columns if col not in df.columns]
+            header = pd.read_csv(csv_path, nrows=0)
+            missing_columns = [col for col in required_columns if col not in header.columns]
             if missing_columns:
                 logger.error(f"Missing columns in {csv_file}: {missing_columns}")
                 validation_results['details'].append({
@@ -114,76 +119,97 @@ def validate_and_split(**context):
                 })
                 continue
 
-            df['tpep_pickup_datetime'] = pd.to_datetime(df['tpep_pickup_datetime'], errors='coerce')
-            df['tpep_dropoff_datetime'] = pd.to_datetime(df['tpep_dropoff_datetime'], errors='coerce')
-            df['fare_amount'] = pd.to_numeric(df['fare_amount'], errors='coerce')
-            df['trip_distance'] = pd.to_numeric(df['trip_distance'], errors='coerce')
-            df['passenger_count'] = pd.to_numeric(df['passenger_count'], errors='coerce')
-
-            initial_count = len(df)
-
-            valid_mask = (
-                (df['tpep_pickup_datetime'].notna()) &
-                (df['tpep_dropoff_datetime'].notna()) &
-                (df['fare_amount'].fillna(0) > 0) &
-                (df['trip_distance'].fillna(0) > 0) &
-                (df['passenger_count'].fillna(0) > 0) &
-                (df['tpep_dropoff_datetime'] > df['tpep_pickup_datetime'])
-            )
-
-            clean_df = df[valid_mask].copy()
-            quarantine_df = df[~valid_mask].copy()
-
-            quarantine_df['source_file'] = csv_file
-
-            if len(quarantine_df) > 0:
-                flag_df = pd.DataFrame({
-                    'Invalid pickup datetime':     quarantine_df['tpep_pickup_datetime'].isna(),
-                    'Invalid dropoff datetime':    quarantine_df['tpep_dropoff_datetime'].isna(),
-                    'Fare amount <= 0 or NaN':     quarantine_df['fare_amount'].isna() | (quarantine_df['fare_amount'] <= 0),
-                    'Trip distance <= 0 or NaN':   quarantine_df['trip_distance'].isna() | (quarantine_df['trip_distance'] <= 0),
-                    'Passenger count <= 0 or NaN': quarantine_df['passenger_count'].isna() | (quarantine_df['passenger_count'] <= 0),
-                    'Dropoff before pickup':       (quarantine_df['tpep_dropoff_datetime'].notna() &
-                                                    quarantine_df['tpep_pickup_datetime'].notna() &
-                                                    (quarantine_df['tpep_dropoff_datetime'] <= quarantine_df['tpep_pickup_datetime'])),
-                })
-                quarantine_df['error_reason'] = flag_df.apply(
-                    lambda row: '; '.join(col for col, v in row.items() if v) or 'Multiple validation failures',
-                    axis=1
-                )
-                quarantine_df = pd.concat([quarantine_df, flag_df], axis=1)
-
-            validation_results['files_processed'] += 1
-            validation_results['total_records'] += initial_count
-            validation_results['clean_records'] += len(clean_df)
-            validation_results['quarantine_records'] += len(quarantine_df)
-
-            clean_pct = round(len(clean_df) / initial_count * 100, 2) if initial_count > 0 else 0.0
-            validation_results['details'].append({
-                'file': csv_file,
-                'total': initial_count,
-                'clean': len(clean_df),
-                'quarantine': len(quarantine_df),
-                'clean_percentage': clean_pct
-            })
-
-            logger.info(
-                f"✓ {csv_file}: {len(clean_df):,} clean, {len(quarantine_df):,} quarantine "
-                f"({clean_pct}% clean)"
-            )
-
             stem = csv_file.replace('.csv', '')
             clean_path = f'/tmp/clean/{stem}.parquet'
             quarantine_path = f'/tmp/quarantine/{stem}.parquet'
 
-            clean_df.to_parquet(clean_path, compression='snappy', index=False)
-            clean_temp_paths.append(clean_path)
+            clean_writer = None
+            quarantine_writer = None
+            total_count = 0
+            clean_count = 0
+            quarantine_count = 0
 
-            if len(quarantine_df) > 0:
-                quarantine_df.to_parquet(quarantine_path, compression='snappy', index=False)
-                quarantine_temp_paths.append(quarantine_path)
+            try:
+                for chunk in pd.read_csv(csv_path, chunksize=CHUNK_SIZE, low_memory=False):
+                    chunk['tpep_pickup_datetime'] = pd.to_datetime(chunk['tpep_pickup_datetime'], errors='coerce')
+                    chunk['tpep_dropoff_datetime'] = pd.to_datetime(chunk['tpep_dropoff_datetime'], errors='coerce')
+                    chunk['fare_amount'] = pd.to_numeric(chunk['fare_amount'], errors='coerce')
+                    chunk['trip_distance'] = pd.to_numeric(chunk['trip_distance'], errors='coerce')
+                    chunk['passenger_count'] = pd.to_numeric(chunk['passenger_count'], errors='coerce')
 
-            del df, clean_df, quarantine_df
+                    valid_mask = (
+                        (chunk['tpep_pickup_datetime'].notna()) &
+                        (chunk['tpep_dropoff_datetime'].notna()) &
+                        (chunk['fare_amount'].fillna(0) > 0) &
+                        (chunk['trip_distance'].fillna(0) > 0) &
+                        (chunk['passenger_count'].fillna(0) > 0) &
+                        (chunk['tpep_dropoff_datetime'] > chunk['tpep_pickup_datetime'])
+                    )
+
+                    clean_chunk = chunk[valid_mask].copy()
+                    quarantine_chunk = chunk[~valid_mask].copy()
+                    quarantine_chunk['source_file'] = csv_file
+
+                    if len(quarantine_chunk) > 0:
+                        flag_df = pd.DataFrame({
+                            'Invalid pickup datetime':     quarantine_chunk['tpep_pickup_datetime'].isna(),
+                            'Invalid dropoff datetime':    quarantine_chunk['tpep_dropoff_datetime'].isna(),
+                            'Fare amount <= 0 or NaN':     quarantine_chunk['fare_amount'].isna() | (quarantine_chunk['fare_amount'] <= 0),
+                            'Trip distance <= 0 or NaN':   quarantine_chunk['trip_distance'].isna() | (quarantine_chunk['trip_distance'] <= 0),
+                            'Passenger count <= 0 or NaN': quarantine_chunk['passenger_count'].isna() | (quarantine_chunk['passenger_count'] <= 0),
+                            'Dropoff before pickup':       (quarantine_chunk['tpep_dropoff_datetime'].notna() &
+                                                            quarantine_chunk['tpep_pickup_datetime'].notna() &
+                                                            (quarantine_chunk['tpep_dropoff_datetime'] <= quarantine_chunk['tpep_pickup_datetime'])),
+                        })
+                        quarantine_chunk['error_reason'] = flag_df.apply(
+                            lambda row: '; '.join(col for col, v in row.items() if v) or 'Multiple validation failures',
+                            axis=1
+                        )
+
+                    total_count += len(chunk)
+                    clean_count += len(clean_chunk)
+                    quarantine_count += len(quarantine_chunk)
+
+                    if len(clean_chunk) > 0:
+                        table = pa.Table.from_pandas(clean_chunk, preserve_index=False)
+                        if clean_writer is None:
+                            clean_writer = pq.ParquetWriter(clean_path, table.schema, compression='snappy')
+                        clean_writer.write_table(table.cast(clean_writer.schema))
+
+                    if len(quarantine_chunk) > 0:
+                        table = pa.Table.from_pandas(quarantine_chunk, preserve_index=False)
+                        if quarantine_writer is None:
+                            quarantine_writer = pq.ParquetWriter(quarantine_path, table.schema, compression='snappy')
+                        quarantine_writer.write_table(table.cast(quarantine_writer.schema))
+
+                    del chunk, clean_chunk, quarantine_chunk
+
+            finally:
+                if clean_writer:
+                    clean_writer.close()
+                    clean_temp_paths.append(clean_path)
+                if quarantine_writer:
+                    quarantine_writer.close()
+                    quarantine_temp_paths.append(quarantine_path)
+
+            validation_results['files_processed'] += 1
+            validation_results['total_records'] += total_count
+            validation_results['clean_records'] += clean_count
+            validation_results['quarantine_records'] += quarantine_count
+
+            clean_pct = round(clean_count / total_count * 100, 2) if total_count > 0 else 0.0
+            validation_results['details'].append({
+                'file': csv_file,
+                'total': total_count,
+                'clean': clean_count,
+                'quarantine': quarantine_count,
+                'clean_percentage': clean_pct
+            })
+
+            logger.info(
+                f"✓ {csv_file}: {clean_count:,} clean, {quarantine_count:,} quarantine "
+                f"({clean_pct}% clean)"
+            )
 
         except Exception as e:
             validation_results['details'].append({
@@ -211,24 +237,24 @@ def save_clean_data(**context):
 
     if not clean_temp_paths:
         logger.warning("No clean data to save")
+        context['task_instance'].xcom_push(key='silver_paths', value=[])
         context['task_instance'].xcom_push(key='clean_data_saved', value={'file': 'N/A', 'records': 0})
         return "No clean data"
 
     try:
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         saved_files = []
         for src in clean_temp_paths:
             stem = os.path.basename(src).replace('.parquet', '')
-            dest = os.path.join(CLEAN_DATA_PATH, f'{stem}_silver_{timestamp}.parquet')
-            shutil.copy2(src, dest)
+            dest = os.path.join(CLEAN_DATA_PATH, f'{stem}_silver.parquet')
+            shutil.move(src, dest)
             saved_files.append(dest)
-            os.remove(src)
 
         clean_records = context['task_instance'].xcom_pull(
             key='clean_data_rows', task_ids='validate_and_split'
         ) or 0
         logger.info(f"✓ Saved {clean_records:,} clean records across {len(saved_files)} files to {CLEAN_DATA_PATH}")
 
+        context['task_instance'].xcom_push(key='silver_paths', value=saved_files)
         context['task_instance'].xcom_push(
             key='clean_data_saved',
             value={'file': CLEAN_DATA_PATH, 'records': clean_records}
@@ -240,9 +266,39 @@ def save_clean_data(**context):
         raise
 
 
-def save_quarantine_data(**context):
-    os.makedirs(QUARANTINE_DATA_PATH, exist_ok=True)
+_ERROR_FOLDER_MAP = {
+    'Invalid pickup datetime':     'invalid_pickup_datetime',
+    'Invalid dropoff datetime':    'invalid_dropoff_datetime',
+    'Fare amount <= 0 or NaN':     'invalid_fare',
+    'Trip distance <= 0 or NaN':   'invalid_distance',
+    'Passenger count <= 0 or NaN': 'invalid_passenger_count',
+    'Dropoff before pickup':       'invalid_time_sequence',
+}
 
+_METADATA_COLS = ['source_file', 'error_reason']
+
+_ERROR_KEEP_COLS = {
+    'invalid_pickup_datetime':  _METADATA_COLS + ['tpep_pickup_datetime'],
+    'invalid_dropoff_datetime': _METADATA_COLS + ['tpep_dropoff_datetime'],
+    'invalid_fare':             _METADATA_COLS + ['fare_amount'],
+    'invalid_distance':         _METADATA_COLS + ['trip_distance'],
+    'invalid_passenger_count':  _METADATA_COLS + ['passenger_count'],
+    'invalid_time_sequence':    _METADATA_COLS + ['tpep_pickup_datetime', 'tpep_dropoff_datetime'],
+    'multiple_errors':          _METADATA_COLS + [
+        'tpep_pickup_datetime', 'tpep_dropoff_datetime',
+        'fare_amount', 'trip_distance', 'passenger_count',
+    ],
+}
+
+
+def _classify_error_folder(error_reason: str) -> str:
+    matched = [folder for label, folder in _ERROR_FOLDER_MAP.items() if label in error_reason]
+    if len(matched) == 1:
+        return matched[0]
+    return 'multiple_errors'
+
+
+def save_quarantine_data(**context):
     quarantine_temp_paths = context['task_instance'].xcom_pull(
         key='quarantine_temp_paths',
         task_ids='validate_and_split'
@@ -254,25 +310,33 @@ def save_quarantine_data(**context):
         return "No quarantine data"
 
     try:
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        saved_files = []
+        total_saved = 0
+
         for src in quarantine_temp_paths:
             stem = os.path.basename(src).replace('.parquet', '')
-            dest = os.path.join(QUARANTINE_DATA_PATH, f'{stem}_quarantine_{timestamp}.parquet')
-            shutil.copy2(src, dest)
-            saved_files.append(dest)
+            df = pd.read_parquet(src)
+
+            df['_error_folder'] = df['error_reason'].apply(_classify_error_folder)
+
+            for folder_name, group in df.groupby('_error_folder'):
+                dest_dir = os.path.join(QUARANTINE_DATA_PATH, folder_name)
+                os.makedirs(dest_dir, exist_ok=True)
+
+                keep_cols = [c for c in _ERROR_KEEP_COLS[folder_name] if c in group.columns]
+                dest = os.path.join(dest_dir, f'{stem}_quarantine.parquet')
+                group[keep_cols].to_parquet(dest, compression='snappy', index=False)
+                logger.info(f"  -> {folder_name}: {len(group):,} records, {len(keep_cols)} cols → {dest}")
+                total_saved += len(group)
+
             os.remove(src)
 
-        quarantine_records = context['task_instance'].xcom_pull(
-            key='quarantine_data_rows', task_ids='validate_and_split'
-        ) or 0
-        logger.info(f"⚠ Saved {quarantine_records:,} quarantine records across {len(saved_files)} files to {QUARANTINE_DATA_PATH}")
+        logger.info(f"⚠ Saved {total_saved:,} quarantine records to {QUARANTINE_DATA_PATH}/<error_type>/")
 
         context['task_instance'].xcom_push(
             key='quarantine_data_saved',
-            value={'file': QUARANTINE_DATA_PATH, 'records': quarantine_records}
+            value={'file': QUARANTINE_DATA_PATH, 'records': total_saved}
         )
-        return f"Saved {quarantine_records:,} quarantine records"
+        return f"Saved {total_saved:,} quarantine records"
 
     except Exception as e:
         logger.error(f"✗ Error saving quarantine data: {str(e)}")
@@ -280,9 +344,14 @@ def save_quarantine_data(**context):
 
 
 def create_gold_summary(**context):
+    import pyarrow.parquet as pq
+    from collections import defaultdict
+
     os.makedirs(GOLD_DIR, exist_ok=True)
 
-    silver_files = sorted(glob.glob(os.path.join(CLEAN_DATA_PATH, "*.parquet")))
+    silver_files = context['task_instance'].xcom_pull(
+        key='silver_paths', task_ids='save_clean_data'
+    ) or sorted(glob.glob(os.path.join(CLEAN_DATA_PATH, "*.parquet")))
 
     if not silver_files:
         logger.info(f"[GOLD] ไม่พบไฟล์ parquet ใน {CLEAN_DATA_PATH} -- ข้ามการสร้าง Gold Layer")
@@ -290,59 +359,75 @@ def create_gold_summary(**context):
 
     logger.info(f"[GOLD] พบไฟล์ใน Silver จำนวน {len(silver_files)} ไฟล์")
 
-    partials = []
+    daily_agg = defaultdict(lambda: {'trips': 0, 'revenue': 0.0, 'dist_sum': 0.0, 'dist_count': 0})
+
     for fp in silver_files:
         try:
-            part = pd.read_parquet(fp, columns=[
-                'tpep_pickup_datetime', 'tpep_dropoff_datetime', 'trip_distance', 'total_amount'
-            ])
-            if "tpep_dropoff_datetime" in part.columns:
-                part["trip_date"] = pd.to_datetime(part["tpep_dropoff_datetime"], errors="coerce").dt.date
-            else:
-                part["trip_date"] = pd.to_datetime(part["tpep_pickup_datetime"], errors="coerce").dt.date
+            pf = pq.ParquetFile(fp)
+            schema_names = pf.schema_arrow.names
 
-            part = part.dropna(subset=["trip_date"])
-            agg = (
-                part.groupby("trip_date", as_index=False)
-                    .agg(
-                        total_trips  =("trip_date",     "count"),
-                        total_revenue=("total_amount",  "sum"),
-                        distance_sum =("trip_distance", "sum"),
-                    )
-            )
-            partials.append(agg)
-            del part, agg
-            logger.info(f"   -> aggregated {os.path.basename(fp)}")
+            if 'tpep_dropoff_datetime' in schema_names:
+                date_col = 'tpep_dropoff_datetime'
+            elif 'tpep_pickup_datetime' in schema_names:
+                date_col = 'tpep_pickup_datetime'
+            else:
+                logger.warning(f"   -> [WARN] ไม่พบ datetime column ใน {fp} -- ข้าม")
+                continue
+
+            missing = {'total_amount', 'trip_distance'} - set(schema_names)
+            if missing:
+                raise ValueError(f"[GOLD] คอลัมน์จำเป็นหายไปจาก Silver: {missing}")
+
+            row_count = 0
+            for batch in pf.iter_batches(
+                batch_size=CHUNK_SIZE,
+                columns=[date_col, 'total_amount', 'trip_distance']
+            ):
+                chunk = batch.to_pandas()
+                chunk[date_col] = pd.to_datetime(chunk[date_col], errors='coerce')
+                chunk['trip_date'] = chunk[date_col].dt.date
+                chunk = chunk.dropna(subset=['trip_date'])
+
+                for date, grp in chunk.groupby('trip_date'):
+                    daily_agg[date]['trips']      += len(grp)
+                    daily_agg[date]['revenue']    += grp['total_amount'].sum()
+                    daily_agg[date]['dist_sum']   += grp['trip_distance'].sum()
+                    daily_agg[date]['dist_count'] += grp['trip_distance'].count()
+                    row_count += len(grp)
+
+                del chunk
+
+            logger.info(f"   -> loaded {os.path.basename(fp)} | rows={row_count:,}")
+
         except Exception as e:
             logger.warning(f"   -> [WARN] อ่านไฟล์ไม่สำเร็จ {fp}: {e}")
 
-    if not partials:
-        logger.info("[GOLD] ไม่มีไฟล์ที่อ่านได้ -- ข้าม Gold Layer")
+    if not daily_agg:
+        logger.info("[GOLD] ไม่มีข้อมูลที่อ่านได้ -- ข้าม Gold Layer")
         return {"status": "skipped", "reason": "no_readable_files", "rows_written": 0}
 
-    combined = pd.concat(partials, ignore_index=True)
-    daily_summary = (
-        combined.groupby("trip_date", as_index=False)
-                .agg(
-                    total_trips  =("total_trips",   "sum"),
-                    total_revenue=("total_revenue", "sum"),
-                    distance_sum =("distance_sum",  "sum"),
-                )
-                .sort_values("trip_date")
-                .reset_index(drop=True)
-    )
-    daily_summary["average_trip_distance"] = (daily_summary["distance_sum"] / daily_summary["total_trips"]).round(3)
-    daily_summary["total_revenue"] = daily_summary["total_revenue"].round(2)
-    daily_summary = daily_summary.drop(columns=["distance_sum"])
+    rows = []
+    for date, stats in sorted(daily_agg.items()):
+        avg_dist = round(stats['dist_sum'] / stats['dist_count'], 3) if stats['dist_count'] > 0 else 0.0
+        rows.append({
+            'trip_date':             date,
+            'total_trips':           stats['trips'],
+            'total_revenue':         round(stats['revenue'], 2),
+            'average_trip_distance': avg_dist,
+        })
+    daily_summary = pd.DataFrame(rows)
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_path = os.path.join(GOLD_DIR, f"daily_summary_{ts}.json")
-    daily_summary.to_json(output_path, orient='records', indent=2, date_format='iso')
+    output_path = os.path.join(GOLD_DIR, "daily_summary.parquet")
+    daily_summary.to_parquet(output_path, index=False)
 
     logger.info(f"[GOLD] บันทึกไฟล์สำเร็จ -> {output_path}")
     logger.info(f"[GOLD] จำนวนแถว summary = {len(daily_summary):,}")
 
-    result = {"status": "success", "rows_written": int(len(daily_summary)), "output_path": output_path}
+    result = {
+        "status": "success",
+        "rows_written": int(len(daily_summary)),
+        "output_path": output_path,
+    }
     context['task_instance'].xcom_push(key='gold_summary', value=result)
     return result
 
