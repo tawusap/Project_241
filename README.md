@@ -23,10 +23,19 @@ ETL pipeline สำหรับประมวลผลข้อมูล NYC Ye
 ```
 Project_2/
 ├── dags/
-│   └── dag_yellow_taxi_pipeline.py        # Airflow DAG หลัก
+│   ├── dag_yellow_taxi_pipeline.py        # Airflow DAG — task definitions และ dependencies
+│   └── pipeline/                          # Business logic แยกตาม concern
+│       ├── config.py                      # Constants, paths, error maps
+│       ├── validation.py                  # validate_and_split
+│       ├── storage.py                     # save_clean_data, save_quarantine_data
+│       ├── star_schema.py                 # create_star_schema (Gold layer)
+│       └── reporting.py                   # generate_report
 ├── tests/
-│   ├── test_dag_yellow_taxi_pipeline.py   # Unit tests
-│   └── check_fact_trips.py               # สคริปต์ตรวจสอบ fact table
+│   ├── helpers.py                         # Shared test utilities
+│   ├── test_validation.py                 # Unit tests: get_csv_files, validate_and_split
+│   ├── test_storage.py                    # Unit tests: save_clean_data, save_quarantine_data
+│   ├── test_reporting.py                  # Unit tests: generate_report
+│   └── check_fact_trips.py               # สคริปต์ตรวจสอบ fact table หลัง pipeline รัน
 ├── archive/
 │   ├── raw/                               # ไฟล์ CSV ต้นทาง (2019-2020)
 │   └── test_raw/                          # ไฟล์ CSV สำหรับ development
@@ -243,19 +252,23 @@ dim_date --> fact_trips <-- dim_time
 
 ## Testing
 
-**Unit Tests** (`tests/test_dag_yellow_taxi_pipeline.py`)
+**Unit Tests** — แบ่งตาม pipeline module ไม่ต้องรัน Airflow จริง
 
-ทดสอบ logic ของแต่ละฟังก์ชันโดยไม่ต้องรัน Airflow จริง ครอบคลุม:
-- การค้นหาไฟล์ CSV และกรองชื่อไฟล์
-- ความถูกต้องของการแยก clean/quarantine
-- การจัดกลุ่ม error type
-- Data quality threshold และการ trigger alert
-- การลบ temp files หลังประมวลผล
-- Edge cases: ไม่มีไฟล์, ไม่มีข้อมูล, column หายไป
+| ไฟล์ | ครอบคลุม |
+|------|---------|
+| `tests/test_validation.py` | `get_csv_files`, `validate_and_split` |
+| `tests/test_storage.py` | `save_clean_data`, `save_quarantine_data` |
+| `tests/test_reporting.py` | `generate_report` (alert threshold, percentages) |
+| `tests/helpers.py` | shared utilities: `_make_context`, `_sample_df` |
+
+รันทั้งหมด:
+```bash
+python -m pytest tests/test_validation.py tests/test_storage.py tests/test_reporting.py -v
+```
 
 **Data Quality Check** (`tests/check_fact_trips.py`)
 
-ตรวจสอบความสมบูรณ์ของ Star Schema หลังรัน pipeline ครอบคลุม 9 หัวข้อ:
+ตรวจสอบความสมบูรณ์ของ Star Schema หลังรัน pipeline จริง ครอบคลุม 9 หัวข้อ:
 1. ภาพรวม (row count, columns, date range)
 2. Null values ทุก column
 3. FK integrity ระหว่าง fact และ dimension tables
@@ -265,6 +278,10 @@ dim_date --> fact_trips <-- dim_time
 7. Top 5 วันที่มี trip มากสุด
 8. Trip breakdown by vendor
 9. Trip breakdown by payment type
+
+```bash
+python tests/check_fact_trips.py
+```
 
 ---
 
