@@ -6,6 +6,7 @@ from airflow.providers.standard.operators.python import PythonOperator
 import pandas as pd
 import os
 import glob
+import re
 import shutil
 import logging
 
@@ -36,7 +37,7 @@ dag = DAG(
 
 
 def get_csv_files(**context):
-    archive_path = '/opt/airflow/archive/test_raw'
+    archive_path = '/opt/airflow/archive/raw'
 
     if not os.path.exists(archive_path):
         logger.warning(f"Raw path {archive_path} does not exist. Creating it.")
@@ -60,7 +61,7 @@ def get_csv_files(**context):
 
 
 def validate_and_split(**context):
-    archive_path = '/opt/airflow/archive/test_raw'
+    archive_path = '/opt/airflow/archive/raw'
 
     csv_files = context['task_instance'].xcom_pull(
         key='csv_files',
@@ -123,6 +124,9 @@ def validate_and_split(**context):
             clean_path = f'/tmp/clean/{stem}.parquet'
             quarantine_path = f'/tmp/quarantine/{stem}.parquet'
 
+            _m = re.search(r'(\d{4})-\d{2}', csv_file)
+            expected_year = int(_m.group(1)) if _m else None
+
             clean_writer = None
             quarantine_writer = None
             total_count = 0
@@ -137,13 +141,19 @@ def validate_and_split(**context):
                     chunk['trip_distance'] = pd.to_numeric(chunk['trip_distance'], errors='coerce')
                     chunk['passenger_count'] = pd.to_numeric(chunk['passenger_count'], errors='coerce')
 
+                    year_ok = (
+                        chunk['tpep_pickup_datetime'].dt.year == expected_year
+                        if expected_year else True
+                    )
+
                     valid_mask = (
                         (chunk['tpep_pickup_datetime'].notna()) &
                         (chunk['tpep_dropoff_datetime'].notna()) &
                         (chunk['fare_amount'].fillna(0) > 0) &
                         (chunk['trip_distance'].fillna(0) > 0) &
-                        (chunk['passenger_count'].fillna(0) > 0) &
-                        (chunk['tpep_dropoff_datetime'] > chunk['tpep_pickup_datetime'])
+                        (chunk['passenger_count'].isna() | (chunk['passenger_count'] > 0)) &
+                        (chunk['tpep_dropoff_datetime'] > chunk['tpep_pickup_datetime']) &
+                        year_ok
                     )
 
                     clean_chunk = chunk[valid_mask].copy()
@@ -156,10 +166,13 @@ def validate_and_split(**context):
                             'Invalid dropoff datetime':    quarantine_chunk['tpep_dropoff_datetime'].isna(),
                             'Fare amount <= 0 or NaN':     quarantine_chunk['fare_amount'].isna() | (quarantine_chunk['fare_amount'] <= 0),
                             'Trip distance <= 0 or NaN':   quarantine_chunk['trip_distance'].isna() | (quarantine_chunk['trip_distance'] <= 0),
-                            'Passenger count <= 0 or NaN': quarantine_chunk['passenger_count'].isna() | (quarantine_chunk['passenger_count'] <= 0),
+                            'Passenger count = 0':         quarantine_chunk['passenger_count'].notna() & (quarantine_chunk['passenger_count'] <= 0),
                             'Dropoff before pickup':       (quarantine_chunk['tpep_dropoff_datetime'].notna() &
                                                             quarantine_chunk['tpep_pickup_datetime'].notna() &
                                                             (quarantine_chunk['tpep_dropoff_datetime'] <= quarantine_chunk['tpep_pickup_datetime'])),
+                            'Pickup year mismatch':        (quarantine_chunk['tpep_pickup_datetime'].notna() &
+                                                            (quarantine_chunk['tpep_pickup_datetime'].dt.year != expected_year))
+                                                           if expected_year else False,
                         })
                         quarantine_chunk['error_reason'] = flag_df.apply(
                             lambda row: '; '.join(col for col, v in row.items() if v) or 'Multiple validation failures',
@@ -271,8 +284,9 @@ _ERROR_FOLDER_MAP = {
     'Invalid dropoff datetime':    'invalid_dropoff_datetime',
     'Fare amount <= 0 or NaN':     'invalid_fare',
     'Trip distance <= 0 or NaN':   'invalid_distance',
-    'Passenger count <= 0 or NaN': 'invalid_passenger_count',
+    'Passenger count = 0':         'invalid_passenger_count',
     'Dropoff before pickup':       'invalid_time_sequence',
+    'Pickup year mismatch':        'invalid_year',
 }
 
 _METADATA_COLS = ['source_file', 'error_reason']
@@ -284,6 +298,7 @@ _ERROR_KEEP_COLS = {
     'invalid_distance':         _METADATA_COLS + ['trip_distance'],
     'invalid_passenger_count':  _METADATA_COLS + ['passenger_count'],
     'invalid_time_sequence':    _METADATA_COLS + ['tpep_pickup_datetime', 'tpep_dropoff_datetime'],
+    'invalid_year':             _METADATA_COLS + ['tpep_pickup_datetime'],
     'multiple_errors':          _METADATA_COLS + [
         'tpep_pickup_datetime', 'tpep_dropoff_datetime',
         'fare_amount', 'trip_distance', 'passenger_count',
@@ -343,92 +358,197 @@ def save_quarantine_data(**context):
         raise
 
 
-def create_gold_summary(**context):
+def create_star_schema(**context):
+    import pyarrow as pa
     import pyarrow.parquet as pq
-    from collections import defaultdict
 
-    os.makedirs(GOLD_DIR, exist_ok=True)
+    STAR_SCHEMA_DIR = os.path.join(GOLD_DIR, 'star_schema')
+    os.makedirs(STAR_SCHEMA_DIR, exist_ok=True)
 
     silver_files = context['task_instance'].xcom_pull(
         key='silver_paths', task_ids='save_clean_data'
     ) or sorted(glob.glob(os.path.join(CLEAN_DATA_PATH, "*.parquet")))
 
     if not silver_files:
-        logger.info(f"[GOLD] ไม่พบไฟล์ parquet ใน {CLEAN_DATA_PATH} -- ข้ามการสร้าง Gold Layer")
-        return {"status": "skipped", "reason": "silver_empty", "rows_written": 0}
+        logger.info("[STAR SCHEMA] ไม่พบไฟล์ใน Silver -- ข้ามการสร้าง Gold Layer")
+        return {"status": "skipped", "reason": "silver_empty"}
 
-    logger.info(f"[GOLD] พบไฟล์ใน Silver จำนวน {len(silver_files)} ไฟล์")
+    logger.info(f"[STAR SCHEMA] พบไฟล์ Silver {len(silver_files)} ไฟล์")
 
-    daily_agg = defaultdict(lambda: {'trips': 0, 'revenue': 0.0, 'dist_sum': 0.0, 'dist_count': 0})
+    # static dimension tables
+    dim_time = pd.DataFrame({
+        'time_key': range(24),
+        'hour': range(24),
+        'time_period': [
+            'night' if h < 6 else 'morning' if h < 12 else 'afternoon' if h < 18 else 'evening'
+            for h in range(24)
+        ],
+    })
 
+    dim_vendor = pd.DataFrame([
+        {'vendor_key': 1, 'vendor_id': 1, 'vendor_name': 'Creative Mobile Technologies'},
+        {'vendor_key': 2, 'vendor_id': 2, 'vendor_name': 'VeriFone Inc.'},
+        {'vendor_key': 0, 'vendor_id': 0, 'vendor_name': 'Unknown'},
+    ])
+
+    dim_payment_type = pd.DataFrame([
+        {'payment_key': 1, 'payment_type_code': 1, 'payment_description': 'Credit card'},
+        {'payment_key': 2, 'payment_type_code': 2, 'payment_description': 'Cash'},
+        {'payment_key': 3, 'payment_type_code': 3, 'payment_description': 'No charge'},
+        {'payment_key': 4, 'payment_type_code': 4, 'payment_description': 'Dispute'},
+        {'payment_key': 5, 'payment_type_code': 5, 'payment_description': 'Unknown'},
+        {'payment_key': 6, 'payment_type_code': 6, 'payment_description': 'Voided trip'},
+        {'payment_key': 0, 'payment_type_code': 0, 'payment_description': 'Not recorded'},
+    ])
+
+    dim_rate_code = pd.DataFrame([
+        {'rate_code_key': 1, 'rate_code_id': 1, 'rate_code_description': 'Standard rate'},
+        {'rate_code_key': 2, 'rate_code_id': 2, 'rate_code_description': 'JFK'},
+        {'rate_code_key': 3, 'rate_code_id': 3, 'rate_code_description': 'Newark'},
+        {'rate_code_key': 4, 'rate_code_id': 4, 'rate_code_description': 'Nassau or Westchester'},
+        {'rate_code_key': 5, 'rate_code_id': 5, 'rate_code_description': 'Negotiated fare'},
+        {'rate_code_key': 6, 'rate_code_id': 6, 'rate_code_description': 'Group ride'},
+        {'rate_code_key': 0, 'rate_code_id': 0, 'rate_code_description': 'Not recorded'},
+    ])
+
+    # Pass 1: scan only pickup datetime column to build dim_date (memory-light)
+    logger.info("[STAR SCHEMA] Pass 1: สร้าง dim_date...")
+    unique_dates = set()
     for fp in silver_files:
         try:
             pf = pq.ParquetFile(fp)
-            schema_names = pf.schema_arrow.names
-
-            if 'tpep_dropoff_datetime' in schema_names:
-                date_col = 'tpep_dropoff_datetime'
-            elif 'tpep_pickup_datetime' in schema_names:
-                date_col = 'tpep_pickup_datetime'
-            else:
-                logger.warning(f"   -> [WARN] ไม่พบ datetime column ใน {fp} -- ข้าม")
+            if 'tpep_pickup_datetime' not in pf.schema_arrow.names:
                 continue
-
-            missing = {'total_amount', 'trip_distance'} - set(schema_names)
-            if missing:
-                raise ValueError(f"[GOLD] คอลัมน์จำเป็นหายไปจาก Silver: {missing}")
-
-            row_count = 0
-            for batch in pf.iter_batches(
-                batch_size=CHUNK_SIZE,
-                columns=[date_col, 'total_amount', 'trip_distance']
-            ):
-                chunk = batch.to_pandas()
-                chunk[date_col] = pd.to_datetime(chunk[date_col], errors='coerce')
-                chunk['trip_date'] = chunk[date_col].dt.date
-                chunk = chunk.dropna(subset=['trip_date'])
-
-                for date, grp in chunk.groupby('trip_date'):
-                    daily_agg[date]['trips']      += len(grp)
-                    daily_agg[date]['revenue']    += grp['total_amount'].sum()
-                    daily_agg[date]['dist_sum']   += grp['trip_distance'].sum()
-                    daily_agg[date]['dist_count'] += grp['trip_distance'].count()
-                    row_count += len(grp)
-
-                del chunk
-
-            logger.info(f"   -> loaded {os.path.basename(fp)} | rows={row_count:,}")
-
+            for batch in pf.iter_batches(batch_size=CHUNK_SIZE, columns=['tpep_pickup_datetime']):
+                s = pd.to_datetime(batch.column('tpep_pickup_datetime').to_pandas(), errors='coerce')
+                unique_dates.update(s.dt.date.dropna().unique())
+            del pf
         except Exception as e:
-            logger.warning(f"   -> [WARN] อ่านไฟล์ไม่สำเร็จ {fp}: {e}")
+            logger.warning(f"  -> [WARN] Pass 1 อ่าน {fp} ไม่สำเร็จ: {e}")
 
-    if not daily_agg:
-        logger.info("[GOLD] ไม่มีข้อมูลที่อ่านได้ -- ข้าม Gold Layer")
-        return {"status": "skipped", "reason": "no_readable_files", "rows_written": 0}
+    if not unique_dates:
+        logger.info("[STAR SCHEMA] ไม่มีข้อมูล datetime -- ข้าม")
+        return {"status": "skipped", "reason": "no_readable_files"}
 
-    rows = []
-    for date, stats in sorted(daily_agg.items()):
-        avg_dist = round(stats['dist_sum'] / stats['dist_count'], 3) if stats['dist_count'] > 0 else 0.0
-        rows.append({
-            'trip_date':             date,
-            'total_trips':           stats['trips'],
-            'total_revenue':         round(stats['revenue'], 2),
-            'average_trip_distance': avg_dist,
+    dim_date_rows = []
+    for d in sorted(unique_dates):
+        dt = pd.Timestamp(d)
+        dim_date_rows.append({
+            'date_key':    int(dt.strftime('%Y%m%d')),
+            'full_date':   d,
+            'year':        dt.year,
+            'month':       dt.month,
+            'day':         dt.day,
+            'day_of_week': dt.dayofweek,
+            'day_name':    dt.day_name(),
+            'month_name':  dt.month_name(),
+            'quarter':     dt.quarter,
+            'is_weekend':  dt.dayofweek >= 5,
         })
-    daily_summary = pd.DataFrame(rows)
+    dim_date = pd.DataFrame(dim_date_rows)
+    logger.info(f"  -> dim_date: {len(dim_date):,} unique dates")
 
-    output_path = os.path.join(GOLD_DIR, "daily_summary.parquet")
-    daily_summary.to_parquet(output_path, index=False)
-
-    logger.info(f"[GOLD] บันทึกไฟล์สำเร็จ -> {output_path}")
-    logger.info(f"[GOLD] จำนวนแถว summary = {len(daily_summary):,}")
-
-    result = {
-        "status": "success",
-        "rows_written": int(len(daily_summary)),
-        "output_path": output_path,
+    # save dimension tables (all small, safe to hold in memory)
+    dim_tables = {
+        'dim_date':         dim_date,
+        'dim_time':         dim_time,
+        'dim_vendor':       dim_vendor,
+        'dim_payment_type': dim_payment_type,
+        'dim_rate_code':    dim_rate_code,
     }
-    context['task_instance'].xcom_push(key='gold_summary', value=result)
+    row_counts = {}
+    for name, tbl in dim_tables.items():
+        out = os.path.join(STAR_SCHEMA_DIR, f'{name}.parquet')
+        tbl.to_parquet(out, compression='snappy', index=False)
+        row_counts[name] = len(tbl)
+        logger.info(f"  [GOLD] {name}.parquet | rows={len(tbl):,}")
+
+    # FK lookup maps
+    date_map = dict(zip(dim_date['full_date'], dim_date['date_key']))
+    vendor_map = dict(zip(dim_vendor['vendor_id'], dim_vendor['vendor_key']))
+    payment_map = dict(zip(dim_payment_type['payment_type_code'], dim_payment_type['payment_key']))
+    rate_map = dict(zip(dim_rate_code['rate_code_id'], dim_rate_code['rate_code_key']))
+
+    # Pass 2: build fact_trips streaming — one batch in memory at a time
+    logger.info("[STAR SCHEMA] Pass 2: สร้าง fact_trips แบบ streaming...")
+    MEASURE_COLS = (
+        'passenger_count', 'trip_distance', 'fare_amount', 'extra', 'mta_tax',
+        'tip_amount', 'tolls_amount', 'improvement_surcharge', 'congestion_surcharge', 'total_amount',
+    )
+    fact_path = os.path.join(STAR_SCHEMA_DIR, 'fact_trips.parquet')
+    fact_writer = None
+    trip_id_counter = 0
+    total_fact_rows = 0
+
+    try:
+        for fp in silver_files:
+            try:
+                pf = pq.ParquetFile(fp)
+                schema_names = set(pf.schema_arrow.names)
+                file_rows = 0
+
+                for batch in pf.iter_batches(batch_size=CHUNK_SIZE):
+                    chunk = batch.to_pandas()
+                    chunk['tpep_pickup_datetime'] = pd.to_datetime(chunk['tpep_pickup_datetime'], errors='coerce')
+                    chunk['tpep_dropoff_datetime'] = pd.to_datetime(chunk['tpep_dropoff_datetime'], errors='coerce')
+                    n = len(chunk)
+
+                    fact = pd.DataFrame()
+                    fact['trip_id']  = range(trip_id_counter, trip_id_counter + n)
+                    fact['date_key'] = chunk['tpep_pickup_datetime'].dt.date.map(date_map).fillna(0).astype(int)
+                    fact['time_key'] = chunk['tpep_pickup_datetime'].dt.hour.fillna(0).astype(int)
+
+                    if 'VendorID' in schema_names:
+                        fact['vendor_key'] = pd.to_numeric(chunk['VendorID'], errors='coerce').fillna(0).astype(int).map(vendor_map).fillna(0).astype(int)
+                    else:
+                        fact['vendor_key'] = 0
+
+                    if 'payment_type' in schema_names:
+                        fact['payment_key'] = pd.to_numeric(chunk['payment_type'], errors='coerce').fillna(0).astype(int).map(payment_map).fillna(0).astype(int)
+                    else:
+                        fact['payment_key'] = 0
+
+                    if 'RatecodeID' in schema_names:
+                        fact['rate_code_key'] = pd.to_numeric(chunk['RatecodeID'], errors='coerce').fillna(0).astype(int).map(rate_map).fillna(0).astype(int)
+                    else:
+                        fact['rate_code_key'] = 0
+
+                    for loc_col in ('PULocationID', 'DOLocationID'):
+                        fact[loc_col] = pd.to_numeric(chunk[loc_col], errors='coerce').fillna(0).astype(int) if loc_col in schema_names else 0
+
+                    for measure in MEASURE_COLS:
+                        fact[measure] = pd.to_numeric(chunk[measure], errors='coerce').fillna(0.0) if measure in schema_names else 0.0
+
+                    fact['trip_duration_minutes'] = (
+                        (chunk['tpep_dropoff_datetime'] - chunk['tpep_pickup_datetime'])
+                        .dt.total_seconds().div(60).clip(lower=0).fillna(0.0).round(2)
+                    )
+
+                    table = pa.Table.from_pandas(fact, preserve_index=False)
+                    if fact_writer is None:
+                        fact_writer = pq.ParquetWriter(fact_path, table.schema, compression='snappy')
+                    fact_writer.write_table(table.cast(fact_writer.schema))
+
+                    trip_id_counter += n
+                    file_rows += n
+                    total_fact_rows += n
+                    del chunk, fact, table
+
+                logger.info(f"  -> {os.path.basename(fp)} | rows={file_rows:,}")
+
+            except Exception as e:
+                logger.warning(f"  -> [WARN] Pass 2 อ่าน {fp} ไม่สำเร็จ: {e}")
+
+    finally:
+        if fact_writer:
+            fact_writer.close()
+
+    row_counts['fact_trips'] = total_fact_rows
+    logger.info(f"  [GOLD] fact_trips.parquet | rows={total_fact_rows:,}")
+    logger.info(f"[STAR SCHEMA] บันทึก {len(row_counts)} ตารางสำเร็จ -> {STAR_SCHEMA_DIR}")
+
+    result = {"status": "success", "tables": row_counts, "output_dir": STAR_SCHEMA_DIR}
+    context['task_instance'].xcom_push(key='star_schema_result', value=result)
     return result
 
 
@@ -480,6 +600,16 @@ def generate_report(**context):
     logger.info("Data Saved:")
     logger.info(f"  Clean Layer (Silver): {clean_saved['records']:,} records → {clean_saved.get('file', 'N/A')}")
     logger.info(f"  Quarantine Layer: {quarantine_saved['records']:,} records → {quarantine_saved.get('file', 'N/A')}")
+
+    star_result = context['task_instance'].xcom_pull(
+        key='star_schema_result', task_ids='create_star_schema'
+    ) or {}
+    if star_result.get('status') == 'success':
+        logger.info("")
+        logger.info("Gold Layer (Star Schema):")
+        for tbl, cnt in star_result.get('tables', {}).items():
+            logger.info(f"  {tbl}: {cnt:,} rows")
+        logger.info(f"  Output: {star_result.get('output_dir', 'N/A')}")
     logger.info("=" * 70)
 
     if total_records == 0:
@@ -527,9 +657,9 @@ save_quarantine_task = PythonOperator(
     dag=dag,
 )
 
-gold_layer_task = PythonOperator(
-    task_id='create_gold_summary',
-    python_callable=create_gold_summary,
+star_schema_task = PythonOperator(
+    task_id='create_star_schema',
+    python_callable=create_star_schema,
     dag=dag,
 )
 
@@ -541,5 +671,5 @@ report_task = PythonOperator(
 
 get_files_task >> validate_task
 validate_task >> [save_clean_task, save_quarantine_task]
-save_clean_task >> gold_layer_task
-[gold_layer_task, save_quarantine_task] >> report_task
+save_clean_task >> star_schema_task
+[star_schema_task, save_quarantine_task] >> report_task
